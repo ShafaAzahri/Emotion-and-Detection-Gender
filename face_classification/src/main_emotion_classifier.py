@@ -1,104 +1,118 @@
-import os
-import shutil
-import sys
-
 import cv2
-from keras.models import load_model
 import numpy as np
+from keras.models import load_model
+import time
 
 from utils.datasets import get_labels
-from utils.inference import detect_faces
-from utils.inference import draw_text
-from utils.inference import draw_bounding_box
-from utils.inference import apply_offsets
-from utils.inference import load_detection_model
-from utils.inference import load_image
+from utils.inference import (
+    draw_text,
+    draw_bounding_box,
+)
 from utils.preprocessor import preprocess_input
 
-
-def most_frequent(List):
-    return max(set(List), key=List.count)
-
-
-def get_most_frequent_emotion(dict_):
-
-    emotions = []
-    for frame_nmr in dict_.keys():
-        for face_nmr in dict_[frame_nmr].keys():
-            emotions.append(dict_[frame_nmr][face_nmr]['emotion'])
-
-    return most_frequent(emotions)
-
-
-def process():
-
-    # parameters for loading data and images
-    image_path = sys.argv[1]
+def run_webcam_emotion_and_gender_detection():
+    # Load models
     detection_model_path = '../trained_models/detection_models/haarcascade_frontalface_default.xml'
     emotion_model_path = '../trained_models/emotion_models/fer2013_mini_XCEPTION.102-0.66.hdf5'
-    emotion_labels = get_labels('fer2013')
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # Load model for gender detection
+    gender_model_path = '../trained_models/gender_models/simple_CNN.81-0.96.hdf5'  # Path to your gender model file
+    gender_classifier = load_model(gender_model_path, compile=False)
 
-    # hyper-parameters for bounding boxes shape
-    emotion_offsets = (0, 0)
-
-    # loading models
-    face_detection = load_detection_model(detection_model_path)
     emotion_classifier = load_model(emotion_model_path, compile=False)
-
-    # getting input model shapes for inference
+    emotion_labels = get_labels('fer2013')
     emotion_target_size = emotion_classifier.input_shape[1:3]
 
-    frames_dir = './.tmp'
-    if image_path[-3:] in ['jpg', 'png']:
-        images_list = [image_path]
-    else:
-        if os.path.exists(frames_dir):
-            shutil.rmtree(frames_dir)
-        os.mkdir(frames_dir)
-        os.system('ffmpeg -i {} {}/$frame_%010d.jpg'.format(image_path, frames_dir))
-        images_list = [os.path.join(frames_dir, f) for f in sorted(os.listdir(frames_dir))]
+    # Load face detection model
+    face_detection = cv2.CascadeClassifier(detection_model_path)
 
-    output = {}
-    for image_path_, image_path in enumerate(images_list):
-        # loading images
-        gray_image = load_image(image_path, grayscale=True)
-        gray_image = np.squeeze(gray_image)
-        gray_image = gray_image.astype('uint8')
+    # Membuka webcam
+    cap = cv2.VideoCapture(0)  # 0 = kamera default
 
-        faces = detect_faces(face_detection, gray_image)
+    if not cap.isOpened():
+        print("Tidak bisa membuka kamera.")
+        return
 
-        tmp = {}
-        for face_coordinates_, face_coordinates in enumerate(faces):
+    print("🎥 Kamera berhasil dibuka. Tekan 'q' untuk keluar.")
 
-            x1, x2, y1, y2 = apply_offsets(face_coordinates, emotion_offsets)
-            gray_face = gray_image[y1:y2, x1:x2]
+    # Menyimpan hasil deteksi
+    result_log = []
 
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)  # Membalik gambar secara horizontal
+
+        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Deteksi wajah dengan haarcascade
+        faces = face_detection.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+
+        for (x, y, w, h) in faces:
+            face_coordinates = (x, y, x + w, y + h)
+
+            # Resize wajah dan preprocess untuk emosi
+            gray_face = gray_image[y:y + h, x:x + w]
             try:
-                gray_face = cv2.resize(gray_face, (emotion_target_size))
+                gray_face = cv2.resize(gray_face, emotion_target_size)
             except:
                 continue
 
             gray_face = preprocess_input(gray_face, True)
             gray_face = np.expand_dims(gray_face, 0)
             gray_face = np.expand_dims(gray_face, -1)
-            emotion_label_arg = np.argmax(emotion_classifier.predict(gray_face))
+
+            # Prediksi emosi
+            start_time = time.time()  # Mulai waktu
+            emotion_prediction = emotion_classifier.predict(gray_face)
+            emotion_label_arg = np.argmax(emotion_prediction)
             emotion_text = emotion_labels[emotion_label_arg]
+            emotion_score = float(np.max(emotion_prediction))
 
-            tmp[face_coordinates_] = {'emotion': emotion_text, 'score': np.amax(emotion_classifier.predict(gray_face))}
+            # Preprocessing wajah untuk gender (convert ke RGB dan resize)
+            face_rgb = cv2.cvtColor(frame[y:y + h, x:x + w], cv2.COLOR_BGR2RGB)
+            face_rgb_resized = cv2.resize(face_rgb, (48, 48))  # Resize ke (48, 48, 3)
+            face_rgb_resized = np.expand_dims(face_rgb_resized, axis=0)
 
-        output[image_path_] = tmp
+            # Prediksi gender
+            gender_prediction = gender_classifier.predict(face_rgb_resized)
+            gender_label_arg = np.argmax(gender_prediction)
+            gender_text = "Male" if gender_label_arg == 0 else "Female"  # 0: Male, 1: Female
+            gender_score = float(np.max(gender_prediction))  # Confidence score
 
-    if os.path.exists(frames_dir):
-        shutil.rmtree(frames_dir)
+            # Hitung waktu deteksi
+            elapsed_time = time.time() - start_time
 
-    return output, get_most_frequent_emotion(output)
+            # Menampilkan bounding box dan teks emosi dan gender
+            color = (0, 255, 0)
+            draw_bounding_box(face_coordinates, frame, color)
+            draw_text(face_coordinates, frame, f"{emotion_text} ({emotion_score:.2f})", color, 0, -30, 1, 2)
+            draw_text(face_coordinates, frame, f"Gender: {gender_text} ({gender_score:.2f})", color, 0, -50, 1, 2)
 
+            # Simpan hasil deteksi dalam log
+            result_log.append({
+                "Frame": len(result_log) + 1,
+                "Emotion": emotion_text,
+                "Gender": gender_text,
+                "Processing Time (ms)": elapsed_time * 1000  # Mengonversi ke milidetik
+            })
+
+        cv2.imshow('Real-Time Emotion and Gender Detection', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Setelah keluar dari loop, tampilkan hasil deteksi
+    print("\nHasil Deteksi:")
+    print(f"{'Frame':<6}{'Emotion':<10}{'Gender':<10}{'Processing Time (ms)':<20}")
+    for result in result_log:
+        print(f"{result['Frame']:<6}{result['Emotion']:<10}{result['Gender']:<10}{result['Processing Time (ms)']:<20}")
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    output, most_frequent_emotion = process()
-
-    for key in output.keys():
-        print(output[key])
-
-    print(most_frequent_emotion)
+    run_webcam_emotion_and_gender_detection()

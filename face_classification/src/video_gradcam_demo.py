@@ -3,6 +3,7 @@ import sys
 import cv2
 import numpy as np
 from keras.models import load_model
+from keras.layers import Lambda
 from utils.grad_cam import compile_gradient_function
 from utils.grad_cam import compile_saliency_function
 from utils.grad_cam import register_gradient
